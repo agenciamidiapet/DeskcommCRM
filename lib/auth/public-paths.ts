@@ -84,6 +84,10 @@ export const PUBLIC_PATHS: RegExp[] = [
   // `GET` da listagem, não `/api/v1/contacts/[id]` nem `/import`, que ainda
   // não têm suporte a Bearer.
   /^\/api\/v1\/contacts$/,
+  // Leitura server-to-server do Director MídiaPet. A rota valida Bearer
+  // `dsk_...` internamente e projeta somente sinais de atividade, nunca PII.
+  // Este bypass impede apenas o proxy de exigir cookie; não torna a rota aberta.
+  /^\/api\/v1\/integrations\/director\/crm-snapshot$/,
   // ENVIO SERVER-TO-SERVER. Mesma dualidade de `/api/v1/contacts` acima, com
   // `mcp:write` em vez de `mcp:read`: sessão de navegador OU Bearer `dsk_…`,
   // resolvidos por `lib/api/auth-dual.ts` DENTRO de cada rota, com a org saindo
