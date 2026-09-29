@@ -18,7 +18,7 @@ import { createAdminClient } from "@/lib/supabase/admin";
 export const dynamic = "force-dynamic";
 
 const MAX_CONTACTS = 5_000;
-const SELECT_COLUMNS = "id,last_activity_at,source";
+const SELECT_COLUMNS = "id,created_at,last_activity_at,source";
 
 export async function GET(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();

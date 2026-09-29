@@ -8,6 +8,7 @@
  */
 export interface DirectorSnapshotContactRow {
   id: string;
+  created_at: string;
   last_activity_at: string | null;
   source: string | null;
 }
@@ -16,6 +17,7 @@ export interface DirectorCrmSnapshot {
   asOf: string;
   contacts: Array<{
     externalId: string;
+    createdAt: string;
     lastActivityAt: string | null;
     source?: string;
   }>;
@@ -44,6 +46,7 @@ export function buildDirectorCrmSnapshot(
     asOf: now.toISOString(),
     contacts: rows.map((row) => ({
       externalId: row.id,
+      createdAt: row.created_at,
       lastActivityAt: row.last_activity_at,
       ...(safeSource(row.source) ? { source: safeSource(row.source) } : {}),
     })),
