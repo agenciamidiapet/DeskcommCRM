@@ -17,33 +17,27 @@ import {
 } from "@/lib/director/crm-snapshot";
 import { ensureRole, ensureScope, McpAuthError, validateBearerToken } from "@/lib/mcp/auth";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { z } from "zod";
 
 export const dynamic = "force-dynamic";
 
-const MAX_SNAPSHOT_ROWS = 5_000;
-const PAGE_SIZE = 500;
-const SELECT_COLUMNS = "id,created_at,last_activity_at,source";
-
-type SnapshotPage<T> = { data: T[] | null; count: number | null; error: unknown };
-
-/** PostgREST may cap a response below .limit(); page until the exact count is read. */
-async function loadScopedRows<T>(
-  readPage: (from: number, to: number) => Promise<SnapshotPage<T>>,
-): Promise<{ rows: T[] } | { error: "internal_error" | "snapshot_too_large" }> {
-  const rows: T[] = [];
-  let expectedCount: number | null = null;
-  while (true) {
-    const page = await readPage(rows.length, rows.length + PAGE_SIZE - 1);
-    if (page.error || page.count === null) return { error: "internal_error" };
-    if (page.count > MAX_SNAPSHOT_ROWS) return { error: "snapshot_too_large" };
-    if (expectedCount !== null && page.count !== expectedCount) return { error: "internal_error" };
-    expectedCount = page.count;
-    const next = page.data ?? [];
-    rows.push(...next);
-    if (rows.length === expectedCount) return { rows };
-    if (next.length === 0 || rows.length > expectedCount) return { error: "internal_error" };
-  }
-}
+const snapshotShape = z.object({
+  asOf: z.string().datetime({ offset: true }),
+  limitExceeded: z.enum(["contacts", "funnel"]).nullable(),
+  contacts: z.array(z.object({
+    id: z.string(),
+    created_at: z.string(),
+    last_activity_at: z.string().nullable(),
+    source: z.string().nullable(),
+  })),
+  leads: z.array(z.object({
+    pipeline_id: z.string(),
+    stage_id: z.string(),
+    status: z.string(),
+  })),
+  stages: z.array(z.object({ id: z.string(), pipeline_id: z.string() })),
+  pipelines: z.array(z.string()),
+});
 
 export async function GET(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
@@ -66,71 +60,37 @@ export async function GET(req: NextRequest): Promise<Response> {
     throw error;
   }
 
-  // Service role intentionally has an explicit filter. The organization comes
-  // only from the validated token, never from a path, query parameter or body.
-  // Every service-role read is constrained by the organization authenticated by
-  // the bearer. Lead IDs are read only for stable pagination; they never leave
-  // this handler. Stage names and free-text business fields are not selected.
+  // A single SQL RPC observes contacts and funnel under one MVCC snapshot.
+  // The service role bypasses RLS, so the organization must come only from the
+  // validated bearer. The SQL function filters all four sources by this ID.
   const admin = createAdminClient();
-  const contacts = await loadScopedRows<DirectorSnapshotContactRow>(async (from, to) => {
-    const result = await admin
-      .from("contacts")
-      .select(SELECT_COLUMNS, { count: "exact" })
-      .eq("organization_id", auth.organizationId)
-      .eq("kind", "person")
-      .is("is_merged_into", null)
-      .order("last_activity_at", { ascending: true, nullsFirst: true })
-      .order("id")
-      .range(from, to);
-    return { data: result.data as DirectorSnapshotContactRow[] | null, count: result.count, error: result.error };
+  const { data, error } = await admin.rpc("fn_director_crm_snapshot", {
+    p_organization_id: auth.organizationId,
   });
-  if ("error" in contacts) return snapshotReadFailure(contacts.error, "contacts", requestId);
-
-  const leads = await loadScopedRows<DirectorSnapshotLeadRow>(async (from, to) => {
-    const result = await admin
-      .from("crm_leads")
-      .select("id,pipeline_id,stage_id,status", { count: "exact" })
-      .eq("organization_id", auth.organizationId)
-      .order("id")
-      .range(from, to);
-    return { data: result.data as DirectorSnapshotLeadRow[] | null, count: result.count, error: result.error };
-  });
-  if ("error" in leads) return snapshotReadFailure(leads.error, "funnel", requestId);
-
-  const stages = await loadScopedRows<DirectorSnapshotStageRow>(async (from, to) => {
-    const result = await admin
-      .from("crm_stages")
-      .select("id,pipeline_id", { count: "exact" })
-      .eq("organization_id", auth.organizationId)
-      .order("id")
-      .range(from, to);
-    return { data: result.data as DirectorSnapshotStageRow[] | null, count: result.count, error: result.error };
-  });
-  if ("error" in stages) return snapshotReadFailure(stages.error, "funnel", requestId);
-
-  const pipelines = await loadScopedRows<{ id: string }>(async (from, to) => {
-    const result = await admin
-      .from("crm_pipelines")
-      .select("id", { count: "exact" })
-      .eq("organization_id", auth.organizationId)
-      .order("id")
-      .range(from, to);
-    return { data: result.data as { id: string }[] | null, count: result.count, error: result.error };
-  });
-  if ("error" in pipelines) return snapshotReadFailure(pipelines.error, "funnel", requestId);
+  if (error) return snapshotReadFailure("internal_error", "contacts", requestId);
+  const parsed = snapshotShape.safeParse(data);
+  if (!parsed.success) return snapshotReadFailure("internal_error", "contacts", requestId);
+  const snapshot = parsed.data;
+  if (snapshot.limitExceeded) {
+    return snapshotReadFailure("snapshot_too_large", snapshot.limitExceeded, requestId);
+  }
 
   let funnelSummary;
   try {
     funnelSummary = buildDirectorFunnelSummary(
-      leads.rows,
-      stages.rows,
-      pipelines.rows.map((pipeline) => pipeline.id),
+      snapshot.leads as DirectorSnapshotLeadRow[],
+      snapshot.stages as DirectorSnapshotStageRow[],
+      snapshot.pipelines,
     );
   } catch {
     return snapshotReadFailure("internal_error", "funnel", requestId);
   }
 
-  return ok(buildDirectorCrmSnapshot(contacts.rows, new Date(), funnelSummary), { requestId });
+  return ok(buildDirectorCrmSnapshot(
+    snapshot.contacts as DirectorSnapshotContactRow[],
+    new Date(snapshot.asOf),
+    funnelSummary,
+  ), { requestId });
 }
 
 function snapshotReadFailure(
