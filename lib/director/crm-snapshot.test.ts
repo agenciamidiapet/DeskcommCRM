@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildDirectorCrmSnapshot } from "@/lib/director/crm-snapshot";
+import { buildDirectorCrmSnapshot, buildDirectorFunnelSummary } from "@/lib/director/crm-snapshot";
 
 describe("buildDirectorCrmSnapshot", () => {
   it("projects only the activity signal required by Director", () => {
@@ -43,5 +43,62 @@ describe("buildDirectorCrmSnapshot", () => {
       source: "other",
     });
     expect(snapshot.contacts[0]).not.toHaveProperty("serviceInterest");
+  });
+});
+
+describe("buildDirectorFunnelSummary", () => {
+  const stages = [
+    { id: "stage-a", pipeline_id: "pipeline-a" },
+    { id: "stage-b", pipeline_id: "pipeline-b" },
+  ];
+
+  it("counts actual business statuses by stage without projecting lead or contact data", () => {
+    const summary = buildDirectorFunnelSummary(
+      [
+        { pipeline_id: "pipeline-a", stage_id: "stage-a", status: "open" },
+        { pipeline_id: "pipeline-a", stage_id: "stage-a", status: "won" },
+        { pipeline_id: "pipeline-b", stage_id: "stage-b", status: "lost" },
+      ],
+      stages,
+      ["pipeline-a", "pipeline-b"],
+    );
+
+    expect(summary).toEqual({
+      totalOpen: 1,
+      totalWon: 1,
+      totalLost: 1,
+      byStage: [
+        { pipelineId: "pipeline-a", stageId: "stage-a", open: 1, won: 1, lost: 0 },
+        { pipelineId: "pipeline-b", stageId: "stage-b", open: 0, won: 0, lost: 1 },
+      ],
+    });
+    expect(JSON.stringify(summary)).not.toMatch(/contactId|leadId|title|description|valueCents/i);
+  });
+
+  it("returns a measured zero when no businesses exist", () => {
+    expect(buildDirectorFunnelSummary([], stages, ["pipeline-a", "pipeline-b"])).toEqual({
+      totalOpen: 0,
+      totalWon: 0,
+      totalLost: 0,
+      byStage: [],
+    });
+  });
+
+  it("rejects cross-pipeline, unknown-stage and unknown-status rows", () => {
+    expect(() => buildDirectorFunnelSummary(
+      [{ pipeline_id: "pipeline-b", stage_id: "stage-a", status: "open" }],
+      stages,
+      ["pipeline-a", "pipeline-b"],
+    )).toThrow();
+    expect(() => buildDirectorFunnelSummary(
+      [{ pipeline_id: "pipeline-a", stage_id: "unknown", status: "open" }],
+      stages,
+      ["pipeline-a"],
+    )).toThrow();
+    expect(() => buildDirectorFunnelSummary(
+      [{ pipeline_id: "pipeline-a", stage_id: "stage-a", status: "pending" }],
+      stages,
+      ["pipeline-a"],
+    )).toThrow();
   });
 });
